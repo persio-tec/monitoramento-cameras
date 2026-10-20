@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Monitoramento por Câmeras
+Comment=Visualize câmeras locais, tire fotos e grave vídeos
+Exec=/usr/sbin/python3 /home/persio/Projetos/monitoramento-cameras/main.py
+Path=/home/persio/Projetos/monitoramento-cameras
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;
+StartupNotify=true
