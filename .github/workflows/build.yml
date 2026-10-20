@@ -1,0 +1,72 @@
+name: Build Multi-Platform
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: |
+          pyinstaller --clean --name MonitoramentoCameras --onefile --windowed --add-data "cameras_ip_wifi_mundial.json;." --add-data "cameras_db.json;." main.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonitoramentoCameras-Windows
+          path: dist/MonitoramentoCameras.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: |
+          pyinstaller --clean --name MonitoramentoCameras --windowed --add-data "cameras_ip_wifi_mundial.json:." --add-data "cameras_db.json:." main.py
+      - name: Create DMG
+        run: |
+          mkdir -p dist/dmg
+          cp -r dist/MonitoramentoCameras.app dist/dmg/
+          hdiutil create -volname "MonitoramentoCameras" -srcfolder dist/dmg -ov -format UDZO dist/MonitoramentoCameras.dmg
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonitoramentoCameras-macOS
+          path: dist/MonitoramentoCameras.dmg
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libglib2.0-0
+          pip install -r requirements.txt pyinstaller
+      - name: Build
+        run: |
+          pyinstaller --clean --name MonitoramentoCameras --onefile --windowed --add-data "cameras_ip_wifi_mundial.json:." --add-data "cameras_db.json:." main.py
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonitoramentoCameras-Linux
+          path: dist/MonitoramentoCameras
