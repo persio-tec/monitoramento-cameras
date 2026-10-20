@@ -1808,14 +1808,18 @@ class Aplicativo(tk.Tk):
         if tipo is None:
             tipo = "WPA"
         tipo = tipo.strip().upper()
+
+        def esc(s):
+            for c in ("\\", ";", ",", ":", '"'):
+                s = str(s).replace(c, "\\" + c)
+            return s
+
         if tipo == "NOPASS":
-            conteudo = f"WIFI:T:nopass;S:{ssid.replace(';','\\;').replace(',','\\,')};;"
+            conteudo = "WIFI:T:nopass;S:" + esc(ssid) + ";;"
         else:
-            def esc(s):
-                for c in ['\\', ';', ',', ':', '"']:
-                    s = str(s).replace(c, '\\' + c)
-                return s
-            conteudo = f"WIFI:T:{tipo};S:{esc(ssid)};P:{esc(senha)};H:false;;"
+            conteudo = (
+                "WIFI:T:" + tipo + ";S:" + esc(ssid) + ";P:" + esc(senha) + ";H:false;;"
+            )
 
         qr = qrcode.QRCode(box_size=8, border=2)
         qr.add_data(conteudo)
