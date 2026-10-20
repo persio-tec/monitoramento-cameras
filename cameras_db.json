@@ -1,0 +1,116 @@
+{
+  "fabricantes": [
+    {"nome": "Hikvision", "prefixos_sn": [], "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/Streaming/Channels/101",
+      "rtsp://{user}:{pass}@{ip}:554/ISAPI/Streaming/Channels/101"
+    ]},
+    {"nome": "Dahua", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/cam/realmonitor?channel=1&subtype=0",
+      "rtsp://{user}:{pass}@{ip}:554/cam/realmonitor?channel=1&subtype=1"
+    ]},
+    {"nome": "Yoosee/KingCam", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/live/ch00_0",
+      "rtsp://{user}:{pass}@{ip}:554/live/ch00_1",
+      "rtsp://{user}:{pass}@{ip}:554/ch0_0.264"
+    ]},
+    {"nome": "XMEYE", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/mediaclip",
+      "rtsp://{user}:{pass}@{ip}:554/ch0_0.264"
+    ]},
+    {"nome": "Vivotek", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/live.sdp"
+    ]},
+    {"nome": "Axis", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/axis-media/media.amp"
+    ]},
+    {"nome": "Foscam", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:88/videoMain",
+      "rtsp://{user}:{pass}@{ip}:554/videoMain"
+    ]},
+    {"nome": "Amcrest", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/cam/realmonitor?channel=1&subtype=0"
+    ]},
+    {"nome": "Reolink", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/h264Preview_01_main",
+      "rtsp://{user}:{pass}@{ip}:554/Preview_01_main"
+    ]},
+    {"nome": "TP-Link Tapo", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/stream1"
+    ]},
+    {"nome": "EZVIZ", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/h264/ch1/main/av_stream"
+    ]},
+    {"nome": "UniFi Protect", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:7447/{camera-id}"
+    ]},
+    {"nome": "Hanwha/Samsung", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/profile2/media.smp"
+    ]},
+    {"nome": "Bosch", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/video"
+    ]},
+    {"nome": "Panasonic", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/MediaInput/h264"
+    ]},
+    {"nome": "Sony", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/media/video1"
+    ]},
+    {"nome": "JVC", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/PSIA/Streaming/channels/0?videoCodecType=H.264"
+    ]},
+    {"nome": "Geovision", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/CH001.sdp"
+    ]},
+    {"nome": "ACTi", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/stream1"
+    ]},
+    {"nome": "Arecont Vision", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/h264.sdp"
+    ]},
+    {"nome": "Mobotix", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/faststream.jpg"
+    ]},
+    {"nome": "Pelco", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/stream1"
+    ]},
+    {"nome": "D-Link", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/play1.sdp"
+    ]},
+    {"nome": "Trendnet", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/play1.sdp"
+    ]},
+    {"nome": "Lorex", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/cam/realmonitor?channel=1&subtype=0"
+    ]},
+    {"nome": "Zavio", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/video1.sdp"
+    ]},
+    {"nome": "Grandstream", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/0"
+    ]},
+    {"nome": "Milesight", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/main/av_stream"
+    ]},
+    {"nome": "Hikvision (Alt)", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:10554/udp/av0_0"
+    ]},
+    {"nome": "Avigilon", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/defaultPrimary0?streamType=u"
+    ]},
+    {"nome": "Honeywell", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/h264"
+    ]},
+    {"nome": "FLIR", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/ch01.264"
+    ]},
+    {"nome": "Wisenet (Hanwha)", "onvif": true, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/profile1/media.smp"
+    ]},
+    {"nome": "Sricam", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/11"
+    ]},
+    {"nome": "Techage", "onvif": false, "rtsp": [
+      "rtsp://{user}:{pass}@{ip}:554/live/ch00_0"
+    ]}
+  ]
+}

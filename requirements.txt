@@ -1,0 +1,4 @@
+opencv-python
+Pillow
+qrcode[pil]
+## 2) Criar arquivo `.spec` para PyInstaller
