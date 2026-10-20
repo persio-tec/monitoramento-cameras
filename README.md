@@ -71,6 +71,42 @@ PBKDF2, e os dois arquivos têm acesso restrito ao usuário local. Se já existi
 outra configuração do Tailscale Serve, o aplicativo não a altera. Não encaminhe
 a porta `8766` no roteador nem publique o link fora da sua rede privada.
 
+## Privacidade e dados locais
+
+O pacote do aplicativo (o `.exe`, o `.app` ou o zip baixado) **não contém dados
+pessoais**. Ele carrega apenas o programa e a lista pública de marcas/caminhos
+RTSP (`cameras_db.json` e `cameras_ip_wifi_mundial.json`). Não existe nenhuma
+senha, endereço IP, nome de câmera ou conta sua dentro do arquivo distribuído.
+
+Tudo que é pessoal é criado **na máquina em que o aplicativo é aberto**, na
+primeira execução:
+
+| Item | Onde fica | O que é |
+|---|---|---|
+| `senha-web.txt` | pasta de dados do usuário | senha do servidor web, gerada automaticamente |
+| `senha-seguranca.txt` | pasta de dados do usuário | hash PBKDF2 da senha de segurança |
+| `capturas/` | pasta ao lado do aplicativo | suas fotos e vídeos |
+
+A pasta de dados do usuário é `~/.local/share/monitoramento-cameras/` no Linux e
+no macOS, e `C:\Users\<usuário>\.local\share\monitoramento-cameras\` no Windows.
+Os dois arquivos de senha são criados com permissão restrita ao usuário local
+(`0600`) e a pasta com `0700`.
+
+Consequências práticas ao instalar em **outro computador**:
+
+- As senhas **não viajam**: o app gera uma nova senha web e pede para você criar
+  uma nova senha de segurança (12+ caracteres) na primeira abertura.
+- A **lista de câmeras não é salva em arquivo** — ela vive apenas na sessão
+  aberta. No PC novo, adicione as câmeras de novo ou use **Configurar
+  automaticamente (ONVIF)**.
+- A pasta `capturas/` começa vazia.
+- O acesso pelo celular depende do **Tailscale instalado e logado na conta
+  daquele computador**. Em outra máquina, o endereço `<hostname>.ts.net` exibido
+  será o daquela máquina; sem o Tailscale logado, o acesso remoto não funciona.
+
+Copiar manualmente a pasta de dados entre computadores levaria as senhas junto —
+evite: é mais seguro deixar cada máquina gerar as suas.
+
 ## Requisitos
 
 - Linux com sessão gráfica e acesso a uma webcam ou câmera USB
@@ -83,7 +119,7 @@ a porta `8766` no roteador nem publique o link fora da sua rede privada.
 ### Opção 1: GitHub Actions (mais fácil, sem instalar Wine)
 1. Suba este repositório para o GitHub
 2. Vá em `Actions > Build Multi-Platform > Run workflow`
-3. Baixe os artefatos: `MonitoramentoCameras-Windows`, `MonitoramentoCameras-macOS`, `MonitoramentoCameras-Linux`
+3. Baixe os artefatos: `MonitoramentoCameras-Windows.zip`, `MonitoramentoCameras-macOS.dmg`, `MonitoramentoCameras-Linux`
 
 ### Opção 2: Localmente
 
