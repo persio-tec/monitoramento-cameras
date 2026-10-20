@@ -1,0 +1,147 @@
+:root {
+  --fundo: #0f172a;
+  --painel: #1e293b;
+  --borda: #334155;
+  --texto: #f1f5f9;
+  --apagado: #94a3b8;
+  --acento: #38bdf8;
+  --erro: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 420px;
+  margin: 0;
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--fundo);
+  color: var(--texto);
+}
+
+main { padding: 12px; }
+
+h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: .2px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.acoes { display: flex; gap: 6px; }
+
+button {
+  font: inherit;
+  color: var(--texto);
+  background: var(--painel);
+  border: 1px solid var(--borda);
+  border-radius: 7px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--acento); }
+button.principal { background: var(--acento); border-color: var(--acento); color: #06283a; font-weight: 600; }
+button.secundario { background: transparent; }
+
+.acoes button { padding: 3px 9px; font-size: 15px; line-height: 1.2; }
+
+.estado {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: var(--painel);
+  border: 1px solid var(--borda);
+  border-left: 3px solid var(--acento);
+  border-radius: 6px;
+  color: var(--apagado);
+}
+
+.estado.erro { border-left-color: var(--erro); color: var(--erro); }
+
+.grade {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.painel {
+  background: #000;
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.painel img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: #000;
+}
+
+.painel figcaption {
+  padding: 4px 7px;
+  font-size: 12px;
+  color: var(--apagado);
+  background: var(--painel);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--apagado);
+}
+
+footer a { color: var(--acento); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+/* ---- configuração ---- */
+form { display: flex; flex-direction: column; gap: 6px; }
+
+label { margin-top: 6px; font-weight: 600; }
+
+input {
+  font: inherit;
+  color: var(--texto);
+  background: var(--painel);
+  border: 1px solid var(--borda);
+  border-radius: 7px;
+  padding: 7px 9px;
+}
+
+input:focus { outline: none; border-color: var(--acento); }
+
+.dica { margin: 2px 0 4px; font-size: 11.5px; color: var(--apagado); }
+
+code {
+  background: var(--painel);
+  border: 1px solid var(--borda);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: 11.5px;
+}
+
+.erro {
+  margin: 6px 0;
+  padding: 7px 10px;
+  background: rgba(248, 113, 113, .12);
+  border: 1px solid var(--erro);
+  border-radius: 6px;
+  color: var(--erro);
+}
+
+form button.principal { margin-top: 10px; }

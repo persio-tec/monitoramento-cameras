@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Câmeras locais</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Tela das câmeras -->
+  <main id="tela-cameras" hidden>
+    <header>
+      <h1>Câmeras locais</h1>
+      <div class="acoes">
+        <button id="botao-recarregar" title="Recarregar câmeras">⟳</button>
+        <button id="botao-configurar" title="Trocar endereço ou senha">⚙</button>
+      </div>
+    </header>
+    <p id="estado" class="estado" hidden></p>
+    <div id="grade" class="grade"></div>
+    <footer>
+      <span id="rodape"></span>
+      <a id="botao-abrir" href="#" target="_blank" rel="noopener">Abrir em aba ↗</a>
+    </footer>
+  </main>
+
+  <!-- Tela de configuração -->
+  <main id="tela-configurar" hidden>
+    <h1>Configurar</h1>
+    <form id="formulario">
+      <label for="endereco">Endereço do aplicativo</label>
+      <input id="endereco" name="endereco" type="text" required
+             placeholder="http://127.0.0.1:8766"
+             spellcheck="false" autocomplete="off">
+      <p class="dica">
+        Na mesma máquina use <code>http://127.0.0.1:8766</code>. De outro
+        aparelho use o link da VPN Tailscale
+        (<code>https://&lt;hostname&gt;.ts.net</code>) que aparece no app.
+      </p>
+
+      <label for="usuario">Usuário</label>
+      <input id="usuario" name="usuario" type="text" value="camera"
+             spellcheck="false" autocomplete="off">
+
+      <label for="senha">Senha</label>
+      <input id="senha" name="senha" type="password" required
+             autocomplete="off">
+      <p class="dica">
+        É a senha mostrada no app em
+        <strong>Acesso seguro pelo celular → Mostrar login e senha</strong>.
+      </p>
+
+      <p id="erro" class="erro" hidden></p>
+
+      <button type="submit" class="principal">Salvar e ver câmeras</button>
+      <button type="button" id="botao-cancelar" class="secundario" hidden>
+        Cancelar
+      </button>
+    </form>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>
