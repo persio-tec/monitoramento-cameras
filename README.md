@@ -25,11 +25,29 @@ No quadro **Câmeras na rede local (Wi-Fi)**:
   câmera com o endereço RTSP correto. É o jeito mais rápido quando as câmeras
   são ONVIF (a maioria das IP cams é). Deixe o usuário em branco para tentar
   câmeras sem senha.
+- **Conectar ao NVR** — digite o IP (ou nome) do gravador NVR/DVR/XVR no campo
+  **NVR**, clique em **Conectar ao NVR** e informe o usuário e a senha do
+  gravador. O app fala com o NVR via ONVIF e lista todos os canais dele no
+  campo "Câmera" (ex.: `Canal 1: Camera 01`). Escolha o canal e clique em
+  **Adicionar câmera de rede**: o endereço RTSP do canal (por exemplo
+  `/Streaming/Channels/101` nos Hikvision) é descoberto sozinho e vai junto
+  com as credenciais, sem precisar montar a URL na mão. Também funciona com
+  NVRs que exigem autenticação no RTSP.
 - **ID da câmera** + **Localizar na rede** — informe o ID/serial da câmera
   (aquele número no rótulo/etiqueta dela), o IP (`192.168.0.10`), um nome de
   host (`camera-sala`) ou uma URL completa, e clique em **Localizar na rede**.
   O app confirma que a câmera responde, verifica as portas RTSP e diz se ela
   fala ONVIF, preenchendo o campo "Câmera" com o resultado.
+- **Buscar pelo ID do CMS (UID)** — para câmeras que só aparecem no software
+  CMS (XMEYE, Yoosee, Dahua Configuração, etc.): digite o ID/UID delas no
+  campo **ID da câmera** e clique no botão. O app varre a rede local pelas
+  portas típicas de CMS/DVR (9530, 5050, 34567, 37777, 8000) e ainda confere
+  se o ID bate com o número de série que a câmera publica no ONVIF — os
+  aparelhos em que o ID confere são listados primeiro, marcados com
+  "ID confere". Os achados entram no campo "Câmera" com a porta RTSP certa
+  (554 ou 8554) e vão para **Adicionar câmera de rede**. Obs.: o CMS encontra
+  a câmera pela internet (P2P); essa busca só acha câmeras que estão ligadas
+  na mesma rede deste computador.
 - **Buscar na rede** — procura câmeras com porta RTSP aberta (554/8554) na
   mesma sub-rede. Escolha o IP encontrado, ajuste o caminho RTSP (padrão
   `/stream1`; Hikvision usa `/Streaming/Channels/101`, Dahua
@@ -65,6 +83,42 @@ em `~/.local/share/monitoramento-cameras/senha-seguranca.txt` como hash
 PBKDF2, e os dois arquivos têm acesso restrito ao usuário local. Se já existir
 outra configuração do Tailscale Serve, o aplicativo não a altera. Não encaminhe
 a porta `8766` no roteador nem publique o link fora da sua rede privada.
+
+## Privacidade e dados locais
+
+O pacote do aplicativo (o `.exe`, o `.app` ou o zip baixado) **não contém dados
+pessoais**. Ele carrega apenas o programa e a lista pública de marcas/caminhos
+RTSP (`cameras_db.json` e `cameras_ip_wifi_mundial.json`). Não existe nenhuma
+senha, endereço IP, nome de câmera ou conta sua dentro do arquivo distribuído.
+
+Tudo que é pessoal é criado **na máquina em que o aplicativo é aberto**, na
+primeira execução:
+
+| Item | Onde fica | O que é |
+|---|---|---|
+| `senha-web.txt` | pasta de dados do usuário | senha do servidor web, gerada automaticamente |
+| `senha-seguranca.txt` | pasta de dados do usuário | hash PBKDF2 da senha de segurança |
+| `capturas/` | pasta ao lado do aplicativo | suas fotos e vídeos |
+
+A pasta de dados do usuário é `~/.local/share/monitoramento-cameras/` no Linux e
+no macOS, e `C:\Users\<usuário>\.local\share\monitoramento-cameras\` no Windows.
+Os dois arquivos de senha são criados com permissão restrita ao usuário local
+(`0600`) e a pasta com `0700`.
+
+Consequências práticas ao instalar em **outro computador**:
+
+- As senhas **não viajam**: o app gera uma nova senha web e pede para você criar
+  uma nova senha de segurança (12+ caracteres) na primeira abertura.
+- A **lista de câmeras não é salva em arquivo** — ela vive apenas na sessão
+  aberta. No PC novo, adicione as câmeras de novo ou use **Configurar
+  automaticamente (ONVIF)**.
+- A pasta `capturas/` começa vazia.
+- O acesso pelo celular depende do **Tailscale instalado e logado na conta
+  daquele computador**. Em outra máquina, o endereço `<hostname>.ts.net` exibido
+  será o daquela máquina; sem o Tailscale logado, o acesso remoto não funciona.
+
+Copiar manualmente a pasta de dados entre computadores levaria as senhas junto —
+evite: é mais seguro deixar cada máquina gerar as suas.
 
 ## Requisitos
 

@@ -67,4 +67,3 @@ app = BUNDLE(
     icon=None,
     bundle_identifier='com.persio.monitoramentocameras',
 )
-## 3) Criar scripts de build

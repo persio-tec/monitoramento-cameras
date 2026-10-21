@@ -8,4 +8,3 @@ pyinstaller --clean --name MonitoramentoCameras --onefile --windowed \
   --add-data "cameras_db.json:." \
   main.py
 echo "Pronto! Veja em dist/"
-## 5) GitHub Actions para build automático

@@ -9,6 +9,13 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    # Valores do SignPath (grátis para open source). Enquanto estiverem
+    # vazios o build roda normalmente e só entrega o .exe sem assinatura.
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,11 +27,29 @@ jobs:
       - name: Build
         run: |
           pyinstaller --clean --name MonitoramentoCameras --onefile --windowed --add-data "cameras_ip_wifi_mundial.json;." --add-data "cameras_db.json;." main.py
-      - name: Upload artifact
+      - name: Upload unsigned artifact
+        id: upload-unsigned-artifact
         uses: actions/upload-artifact@v4
         with:
           name: MonitoramentoCameras-Windows
           path: dist/MonitoramentoCameras.exe
+      - name: Sign with SignPath (grátis para open source)
+        if: ${{ env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != '' && env.SIGNPATH_PROJECT_SLUG != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: '${{ secrets.SIGNPATH_API_TOKEN }}'
+          organization-id: '${{ vars.SIGNPATH_ORGANIZATION_ID }}'
+          project-slug: '${{ vars.SIGNPATH_PROJECT_SLUG }}'
+          signing-policy-slug: '${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}'
+          github-artifact-id: '${{ steps.upload-unsigned-artifact.outputs.artifact-id }}'
+          wait-for-completion: true
+          output-artifact-directory: 'dist/assinado'
+      - name: Upload signed artifact
+        if: ${{ env.SIGNPATH_API_TOKEN != '' && env.SIGNPATH_ORGANIZATION_ID != '' && env.SIGNPATH_PROJECT_SLUG != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonitoramentoCameras-Windows-Assinado
+          path: dist/assinado/*
 
   build-macos:
     runs-on: macos-latest
@@ -70,4 +95,3 @@ jobs:
         with:
           name: MonitoramentoCameras-Linux
           path: dist/MonitoramentoCameras
-## 6) Atualizar README com instruções de build

@@ -1,23 +1,41 @@
 {
   "manifest_version": 3,
-  "name": "Câmeras locais (monitoramento)",
-  "version": "1.0.0",
-  "description": "Mostra as câmeras do Monitoramento por Câmeras direto no navegador, pela rede local ou pela VPN Tailscale.",
+  "name": "Câmeras locais + Gravador de Terra (Remover Blur)",
+  "version": "1.1.0",
+  "description": "Mostra as câmeras do Monitoramento por Câmeras e remove borões/blur do Gravador de Terra com modo automático/manual.",
   "permissions": [
     "storage",
+    "scripting",
+    "activeTab",
+    "tabs",
     "declarativeNetRequestWithHostAccess"
   ],
   "optional_host_permissions": [
     "http://*/*",
     "https://*/*"
   ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Câmeras locais"
+    "default_title": "Câmeras locais + Gravador de Terra"
   },
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*/*"
+      ],
+      "js": [
+        "content-gravador.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
 }
