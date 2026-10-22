@@ -1,15 +1,20 @@
-"""Aplicativo local para visualizar câmeras e transmiti-las pela VPN Tailscale."""
+"""Aplicativo local para visualizar câmeras e transmiti-las pela VPN Tailscale
+ou por um túnel SSH."""
 
 import base64
+import getpass
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
+import queue
 import re
 import secrets
 import socket
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -44,8 +49,10 @@ PASTA_CAPTURAS.mkdir(exist_ok=True)
 PASTA_DADOS = Path.home() / ".local" / "share" / "monitoramento-cameras"
 ARQUIVO_SENHA = PASTA_DADOS / "senha-web.txt"
 ARQUIVO_SENHA_SEGURANCA = PASTA_DADOS / "senha-seguranca.txt"
+ARQUIVO_TOKEN = PASTA_DADOS / "token-acesso.txt"
 PORTA_WEB = 8766
 USUARIO_WEB = "camera"
+USUARIO_SSH_PADRAO = "cameras"
 ITERACOES_HASH_SENHA = 600_000
 PORTAS_RTSP = (554, 8554)
 # Portas típicas de CMS/DVR (XMEYE, Dahua, Hikvision) usadas pelo app CMS.
@@ -1155,6 +1162,322 @@ def carregar_ou_criar_senha():
     return senha
 
 
+SCRIPT_USUARIO_SSH = """#!/bin/bash
+# Executado com privilégios de root (via pkexec) para criar ou remover o
+# usuário SSH de acesso às câmeras. A senha chega pelo arquivo de dados
+# apontado em $3 e é apagada assim que é usada.
+set -euo pipefail
+
+acao="${1:-}"
+usuario="${2:-}"
+arquivo_dados="${3:-}"
+
+# Sem hífen: o useradd do Debian recusa esses nomes ("use --badname").
+if [[ ! "$usuario" =~ ^[a-z_][a-z0-9_]{0,31}$ ]]; then
+    echo "NOME_DE_USUARIO_INVALIDO" >&2
+    exit 2
+fi
+
+case "$acao" in
+criar)
+    if [[ ! -r "$arquivo_dados" ]]; then
+        echo "ARQUIVO_ILEGIVEL" >&2
+        exit 3
+    fi
+    senha="$(sed -n '1p' "$arquivo_dados")"
+    chave="$(sed -n '2p' "$arquivo_dados")"
+    rm -f "$arquivo_dados"
+
+    if [[ -z "$senha" ]]; then
+        echo "SENHA_VAZIA" >&2
+        exit 4
+    fi
+
+    if id "$usuario" >/dev/null 2>&1; then
+        usermod -s /bin/bash "$usuario"
+        casa="$(getent passwd "$usuario" | cut -d: -f6)"
+        if [[ ! -d "$casa" ]]; then
+            mkdir -p "$casa"
+            chown "$usuario" "$casa"
+        fi
+    else
+        useradd -m -s /bin/bash "$usuario"
+        casa="$(getent passwd "$usuario" | cut -d: -f6)"
+    fi
+
+    printf '%s:%s\\n' "$usuario" "$senha" | chpasswd
+    senha=""
+
+    mkdir -p "$casa/.ssh"
+    chmod 700 "$casa/.ssh"
+    touch "$casa/.ssh/authorized_keys"
+    chmod 600 "$casa/.ssh/authorized_keys"
+    if [[ -n "$chave" ]] && ! grep -qF "$chave" "$casa/.ssh/authorized_keys"; then
+        printf '%s\\n' "$chave" >> "$casa/.ssh/authorized_keys"
+    fi
+    chown -R "$usuario:$usuario" "$casa/.ssh"
+    ;;
+remover)
+    if id "$usuario" >/dev/null 2>&1; then
+        userdel -r "$usuario" 2>/dev/null || userdel "$usuario"
+    fi
+    ;;
+*)
+    echo "ACAO_DESCONHECIDA" >&2
+    exit 5
+    ;;
+esac
+
+echo "OK"
+"""
+
+
+def caminho_chave_cameras():
+    """Caminho da chave SSH dedicada ao acesso às câmeras."""
+    return Path.home() / ".ssh" / "id_ed25519_cameras"
+
+
+def garantir_chave_cameras():
+    """Garante que exista um par de chaves dedicado às câmeras.
+
+    Sem senha (para o túnel não pedir nada) e com o arquivo privado em 600.
+    """
+    chave = caminho_chave_cameras()
+    publica = chave.with_name(chave.name + ".pub")
+    if chave.exists() and publica.exists():
+        os.chmod(chave, 0o600)
+        return chave
+    pasta = chave.parent
+    pasta.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(pasta, 0o700)
+    subprocess.run(
+        [
+            "ssh-keygen", "-t", "ed25519", "-f", str(chave), "-N", "",
+            "-C", "acesso-cameras",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    os.chmod(chave, 0o600)
+    return chave
+
+
+def linha_authorized_keys(chave=None):
+    """Linha do authorized_keys com a chave dedicada e as restrições.
+
+    `restrict` desliga PTY, agente e X11; `port-forwarding` religa o
+    encaminhamento de portas (que é o que o túnel precisa) e `permitopen`
+    limita o destino ao 127.0.0.1 do próprio servidor.
+    """
+    chave = Path(chave) if chave else caminho_chave_cameras()
+    publica = chave.with_name(chave.name + ".pub")
+    if not publica.exists():
+        raise FileNotFoundError(
+            f"A chave pública {publica} não existe."
+        )
+    conteudo = publica.read_text(encoding="utf-8").strip()
+    return f'restrict,port-forwarding,permitopen="127.0.0.1:*" {conteudo}'
+
+
+def usuario_ssh_existe(usuario):
+    """True se já existe uma conta de sistema com esse nome."""
+    try:
+        pwd.getpwnam(usuario)
+    except KeyError:
+        return False
+    return True
+
+
+def senha_ssh_aleatoria(tamanho=16):
+    """Senha aleatória para o usuário SSH (sem ':' e sem quebra de linha)."""
+    alfabeto = (
+        "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+        "-_."
+    )
+    return "".join(secrets.choice(alfabeto) for _ in range(tamanho))
+
+
+def criar_usuario_ssh_sistema(usuario, senha, chave=None):
+    """Cria (ou ajusta) o usuário SSH de acesso às câmeras.
+
+    Usa `pkexec`, então o sistema abre a janela de autenticação do
+    polkit e é o próprio dono da máquina quem digita a senha de
+    administrador — o aplicativo nunca vê essa senha. A senha do usuário
+    SSH, essa sim, é a que foi digitada no aplicativo.
+    """
+    usuario = (usuario or "").strip()
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,31}", usuario):
+        raise ValueError(
+            "Nome de usuário inválido: use até 32 caracteres em minúsculas, "
+            "começando por letra ou _ e sem espaços nem hífen."
+        )
+    if len(senha) < 8:
+        raise ValueError("A senha do usuário SSH precisa ter ao menos 8 caracteres.")
+    if ":" in senha or "\n" in senha or "\r" in senha:
+        raise ValueError("A senha do usuário SSH não pode conter ':' nem quebra de linha.")
+
+    chave = Path(chave) if chave else caminho_chave_cameras()
+    PASTA_DADOS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(PASTA_DADOS, 0o700)
+    script = PASTA_DADOS / "criar-usuario-ssh.sh"
+    script.write_text(SCRIPT_USUARIO_SSH, encoding="utf-8")
+    os.chmod(script, 0o700)
+    arquivo = PASTA_DADOS / ".senha-ssh-tmp"
+    descritor = os.open(arquivo, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descritor, "w", encoding="utf-8") as dados:
+        dados.write(senha + "\n" + linha_authorized_keys(chave) + "\n")
+    try:
+        resultado = _executar_como_admin(
+            ["criar", usuario, str(arquivo)], arquivo=arquivo
+        )
+    finally:
+        try:
+            arquivo.unlink()
+        except FileNotFoundError:
+            pass
+    if resultado.returncode != 0:
+        raise RuntimeError(_erro_do_pkexec(resultado))
+    return usuario
+
+
+def remover_usuario_ssh_sistema(usuario):
+    """Apaga a conta de sistema de um aparelho (pede autorização ao sistema)."""
+    usuario = (usuario or "").strip()
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,31}", usuario):
+        raise ValueError("Nome de usuário inválido.")
+    resultado = _executar_como_admin(["remover", usuario])
+    if resultado.returncode != 0:
+        raise RuntimeError(_erro_do_pkexec(resultado))
+    return usuario
+
+
+def _executar_como_admin(argumentos, arquivo=None):
+    """Roda o script de manutenção como root via pkexec (janela do sistema)."""
+    PASTA_DADOS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(PASTA_DADOS, 0o700)
+    script = PASTA_DADOS / "criar-usuario-ssh.sh"
+    script.write_text(SCRIPT_USUARIO_SSH, encoding="utf-8")
+    os.chmod(script, 0o700)
+    comando = ["pkexec", "/bin/bash", str(script)] + list(argumentos)
+    return subprocess.run(
+        comando,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+
+def _erro_do_pkexec(resultado):
+    """Transforma a saída do pkexec em uma mensagem útil para o usuário."""
+    detalhe = (resultado.stderr or resultado.stdout or "").strip()
+    if resultado.returncode in (126, 127):
+        return (
+            "Não foi possível pedir permissão de administrador (pkexec). "
+            "Abra o app pelo seu desktop para que a janela do sistema apareça."
+        )
+    if "NOME_DE_USUARIO_INVALIDO" in detalhe:
+        return "Nome de usuário inválido."
+    if "ARQUIVO_ILEGIVEL" in detalhe:
+        return "Arquivo temporário da senha não pôde ser lido."
+    if "SENHA_VAZIA" in detalhe:
+        return "A senha do usuário SSH ficou vazia."
+    if "acao cancel" in detalhe.lower() or "not authorized" in detalhe.lower():
+        return "A criação do usuário foi cancelada (sem autorização do sistema)."
+    return detalhe or "Falha ao criar o usuário SSH."
+
+
+ARQUIVO_APARELHOS = PASTA_DADOS / "aparelhos.json"
+
+
+def carregar_aparelhos():
+    """Lista de aparelhos cadastrados (um por conta SSH)."""
+    try:
+        dados = json.loads(ARQUIVO_APARELHOS.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    return dados if isinstance(dados, list) else []
+
+
+def salvar_aparelhos(lista):
+    PASTA_DADOS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ARQUIVO_APARELHOS.write_text(
+        json.dumps(lista, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    os.chmod(ARQUIVO_APARELHOS, 0o600)
+
+
+def nome_usuario_aparelho(nome, ja_existentes=()):
+    """Deriva um nome de usuário válido e único a partir do nome do aparelho."""
+    base = re.sub(r"[^a-z0-9]+", "_", (nome or "").lower()).strip("_")[:18]
+    if not base:
+        base = "aparelho"
+    usuario = f"cam_{base}"
+    numero = 2
+    while usuario_ssh_existe(usuario) or usuario in ja_existentes:
+        usuario = f"cam_{base[:16]}_{numero}"
+        numero += 1
+    return usuario
+
+
+def chave_aparelho(usuario):
+    """Caminho da chave privada que pertence a um aparelho."""
+    return Path.home() / ".ssh" / f"id_ed25519_{usuario}"
+
+
+def gerar_chave_para(destino, comentario):
+    """Gera um par de chaves ed25519 sem senha (túnel não pergunta nada)."""
+    destino = Path(destino)
+    publica = destino.with_name(destino.name + ".pub")
+    if destino.exists() and publica.exists():
+        os.chmod(destino, 0o600)
+        return destino
+    pasta = destino.parent
+    pasta.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(pasta, 0o700)
+    subprocess.run(
+        [
+            "ssh-keygen", "-t", "ed25519", "-f", str(destino), "-N", "",
+            "-C", comentario,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    os.chmod(destino, 0o600)
+    return destino
+
+
+def carregar_ou_criar_token():
+    """Token aleatório que abre a página das câmeras sem pedir login.
+
+    O link http://127.0.0.1:8766/?acesso=TOKEN já entra autenticado: o
+    navegador recebe um cookie e não mostra a janela de login. É o mesmo
+    nível de acesso que a senha, então o link é tão secreto quanto ela —
+    por isso fica num arquivo só do dono (permissão 600).
+    """
+    PASTA_DADOS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(PASTA_DADOS, 0o700)
+    try:
+        token = ARQUIVO_TOKEN.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(24)
+        try:
+            descritor = os.open(
+                ARQUIVO_TOKEN, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+        except FileExistsError:
+            token = ARQUIVO_TOKEN.read_text(encoding="utf-8").strip()
+        else:
+            with os.fdopen(descritor, "w", encoding="utf-8") as arquivo:
+                arquivo.write(token + "\n")
+    if len(token) < 20:
+        raise ValueError(f"O token em {ARQUIVO_TOKEN} é inválido.")
+    os.chmod(ARQUIVO_TOKEN, 0o600)
+    return token
+
+
 def salvar_senha_seguranca(senha):
     sal = secrets.token_bytes(16)
     hash_senha = hashlib.pbkdf2_hmac(
@@ -1188,13 +1511,222 @@ def verificar_senha_seguranca(senha):
     return secrets.compare_digest(hash_informado, hash_salvo)
 
 
+FERRAMENTAS_COPIAR = (
+    ["xclip", "-selection", "clipboard"],
+    ["xsel", "--clipboard", "--input"],
+    ["wl-copy"],
+    ["pbcopy"],
+)
+
+FERRAMENTAS_COLAR = (
+    ["xclip", "-selection", "clipboard", "-output"],
+    ["xsel", "--clipboard", "--output"],
+    ["wl-paste", "--no-newline"],
+    ["pbpaste"],
+)
+
+
+def copiar_texto(widget, texto):
+    """Copia texto para a área de transferência.
+
+    Usa a ferramenta do sistema (xclip/xsel/wl-copy/pbcopy) quando existir,
+    para o conteúdo continuar na área de transferência depois de fechar o
+    app; se não houver nenhuma, fica só com a do Tkinter.
+    """
+    try:
+        widget.clipboard_clear()
+        widget.clipboard_append(texto)
+    except tk.TclError:
+        pass
+    for comando in FERRAMENTAS_COPIAR:
+        try:
+            processo = subprocess.Popen(
+                comando,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except (FileNotFoundError, OSError):
+            continue
+        try:
+            processo.communicate(texto, timeout=3)
+        except subprocess.TimeoutExpired:
+            processo.kill()
+        return True
+    return False
+
+
+def obter_texto_colado(widget):
+    """Lê o texto da área de transferência (Tkinter e, se preciso, sistema)."""
+    try:
+        texto = widget.clipboard_get()
+        if texto:
+            return texto
+    except tk.TclError:
+        pass
+    for comando in FERRAMENTAS_COLAR:
+        try:
+            resultado = subprocess.run(
+                comando,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+        if resultado.returncode == 0 and resultado.stdout:
+            return resultado.stdout
+    return ""
+
+
+def analisar_comando_ssh(texto):
+    """Lê um comando 'ssh ...' colado e devolve (destino, porta_local) ou None.
+
+    Serve para colar um comando pronto — vindo de um chat, e-mail ou de outro
+    computador — e o app preencher os campos sozinho.
+    """
+    partes = (texto or "").strip().split()
+    if len(partes) < 2 or not partes[0].endswith("ssh"):
+        return None
+    destino = None
+    porta_local = None
+    porta_ssh = None
+    chave = None
+    indice = 1
+    while indice < len(partes):
+        parte = partes[indice]
+        if parte == "-L" and indice + 1 < len(partes):
+            campos = partes[indice + 1].split(":")
+            if campos and campos[0].isdigit():
+                porta_local = int(campos[0])
+            indice += 2
+            continue
+        if parte == "-p" and indice + 1 < len(partes):
+            if partes[indice + 1].isdigit():
+                porta_ssh = int(partes[indice + 1])
+            indice += 2
+            continue
+        if parte == "-i" and indice + 1 < len(partes):
+            chave = partes[indice + 1]
+            indice += 2
+            continue
+        if parte in {"-o", "-F", "-J", "-E", "-l"} and indice + 1 < len(partes):
+            indice += 2
+            continue
+        if parte.startswith("-"):
+            indice += 1
+            continue
+        if destino is None:
+            destino = parte
+        indice += 1
+    if not destino:
+        return None
+    if porta_ssh and porta_ssh != 22 and ":" not in destino:
+        destino = f"{destino}:{porta_ssh}"
+    return destino, porta_local, chave
+
+
+def montar_comando_ssh(destino, porta_local=PORTA_WEB, porta_servidor=PORTA_WEB, chave=None):
+    """Monta o comando SSH que encaminha a porta do servidor de câmeras.
+
+    `destino` aceita "host", "usuario@host" e "usuario@host:porta" (a porta
+    aqui é a do próprio SSH, não a do túnel). `chave` é o caminho da chave
+    privada no computador que vai abrir o túnel; em branco, o SSH usa a chave
+    padrão. O comando abre um túnel local (port-forwarding) para a porta do
+    servidor web, que só escuta em 127.0.0.1 — nada é exposto na internet.
+    """
+    destino = (destino or "").strip()
+    if destino.startswith("ssh "):
+        destino = destino[4:].strip()
+    if not destino:
+        raise ValueError("Informe o servidor SSH (ex.: usuario@192.168.0.10).")
+    if any(caractere.isspace() for caractere in destino):
+        raise ValueError("O servidor SSH não pode conter espaços.")
+
+    usuario, _, host = destino.rpartition("@")
+    if "@" not in destino:
+        usuario, host = "", destino
+    if not host:
+        raise ValueError("Use o formato usuario@host ou apenas host.")
+
+    if host.startswith("["):
+        fim = host.find("]")
+        if fim < 0:
+            raise ValueError("Endereço IPv6 inválido.")
+        endereco, resto = host[: fim + 1], host[fim + 1 :]
+    elif host.count(":") == 1:
+        # "host:porta" (um único ":"; IPv6 sem colchetes tem vários).
+        endereco, _, resto = host.partition(":")
+        resto = ":" + resto
+    else:
+        endereco, resto = host, ""
+
+    porta_ssh = 22
+    if resto:
+        if not resto.startswith(":"):
+            raise ValueError("Use o formato host:porta para indicar a porta do SSH.")
+        texto_porta = resto[1:]
+        if not texto_porta.isdigit() or not 1 <= int(texto_porta) <= 65535:
+            raise ValueError("Porta do SSH inválida.")
+        porta_ssh = int(texto_porta)
+
+    if not isinstance(porta_local, int) or not 1 <= porta_local <= 65535:
+        raise ValueError("Porta local inválida.")
+
+    comando = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L",
+               f"{porta_local}:127.0.0.1:{porta_servidor}"]
+    if chave:
+        comando.extend(["-i", str(chave)])
+    if porta_ssh != 22:
+        comando.extend(["-p", str(porta_ssh)])
+    comando.append(f"{usuario}@{endereco}" if usuario else endereco)
+    return " ".join(comando)
+
+
+def extrair_host_ssh(destino):
+    """Separa o host de "usuario@host", "host" ou "host:porta"."""
+    texto = (destino or "").strip()
+    if texto.startswith("ssh "):
+        texto = texto[4:].strip()
+    _, _, host = texto.rpartition("@")
+    if host.startswith("["):
+        fim = host.find("]")
+        return host[: fim + 1] if fim > 0 else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+def sugestao_ssh_host():
+    """Nome desta máquina, para montar o destino do túnel SSH."""
+    try:
+        return socket.gethostname() or "localhost"
+    except OSError:
+        return "localhost"
+
+
+def sugestao_ssh_destino():
+    """Sugere o destino do túnel SSH para esta máquina: usuario@host."""
+    try:
+        usuario = getpass.getuser()
+    except (KeyError, OSError):
+        usuario = ""
+    if usuario_ssh_existe(USUARIO_SSH_PADRAO):
+        usuario = USUARIO_SSH_PADRAO
+    host = sugestao_ssh_host()
+    return f"{usuario}@{host}" if usuario else host
+
+
 class ServidorCameras(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, cameras, senha):
+    def __init__(self, cameras, senha, token=None):
         self.cameras = cameras
         self.senha = senha
+        self.token = token
         self.parar = threading.Event()
         super().__init__(("127.0.0.1", PORTA_WEB), ManipuladorCameras)
 
@@ -1202,7 +1734,30 @@ class ServidorCameras(ThreadingHTTPServer):
 class ManipuladorCameras(BaseHTTPRequestHandler):
     server: ServidorCameras
 
+    def _token_valido(self, valor):
+        """Confere se o valor é o token de acesso da sessão."""
+        token = getattr(self.server, "token", None)
+        if not token or not valor:
+            return False
+        return secrets.compare_digest(valor, token)
+
+    def _token_da_requisicao(self):
+        """Token vindo do cookie (sessão) ou da query string (link de acesso)."""
+        cookie = self.headers.get("Cookie", "")
+        for parte in cookie.split(";"):
+            nome, _, valor = parte.strip().partition("=")
+            if nome == "cam_acesso" and self._token_valido(valor):
+                return valor
+        consulta = urllib.parse.parse_qs(urlsplit(self.path).query)
+        valores = consulta.get("acesso", [])
+        for valor in valores:
+            if self._token_valido(valor):
+                return valor
+        return ""
+
     def _autorizado(self):
+        if self._token_da_requisicao():
+            return True
         cabecalho = self.headers.get("Authorization", "").split(" ", 1)
         if len(cabecalho) != 2 or cabecalho[0].lower() != "basic":
             return False
@@ -1238,6 +1793,22 @@ class ManipuladorCameras(BaseHTTPRequestHandler):
         self.wfile.write(corpo)
 
     def do_GET(self):
+        # Link de acesso (/?acesso=TOKEN): o navegador recebe um cookie e
+        # entra direto, sem a janela de login.
+        consulta = urllib.parse.parse_qs(urlsplit(self.path).query)
+        token_url = (consulta.get("acesso") or [""])[0]
+        if self._token_valido(token_url):
+            self.send_response(302)
+            self.send_header(
+                "Set-Cookie",
+                f"cam_acesso={token_url}; Path=/; HttpOnly; SameSite=Strict",
+            )
+            self.send_header("Location", "/")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if not self._autorizado():
             self._exigir_senha()
             return
@@ -1477,6 +2048,9 @@ class Aplicativo(tk.Tk):
         self._resultado_cms = None
         self._canais_nvr = {}
         self.senha_web = carregar_ou_criar_senha()
+        self.token_acesso = carregar_ou_criar_token()
+        self.aparelhos = carregar_aparelhos()
+        self.fila_trabalhos = queue.Queue()
         self.servidor_web = None
         self.thread_servidor_web = None
         self.hostname_servidor_web = None
@@ -1486,13 +2060,15 @@ class Aplicativo(tk.Tk):
         self.thread_https = None
         self.resultado_https = None
         self.temporizador_credenciais = None
+        self.enderecos_locais = self._detectar_enderecos_locais()
         self.protocol("WM_DELETE_WINDOW", self.fechar)
 
         controles = ttk.Frame(self, padding=10)
         controles.pack(fill="x")
         ttk.Label(controles, text="Índice da câmera:").pack(side="left")
         self.indice = tk.StringVar(value="0")
-        ttk.Entry(controles, textvariable=self.indice, width=6).pack(side="left", padx=6)
+        self.entrada_indice = ttk.Entry(controles, textvariable=self.indice, width=6)
+        self.entrada_indice.pack(side="left", padx=6)
         ttk.Button(controles, text="Adicionar câmera", command=self.adicionar_camera).pack(side="left")
         ttk.Label(controles, text=f"Arquivos: {PASTA_CAPTURAS.resolve()}").pack(side="left", padx=12)
 
@@ -1534,6 +2110,157 @@ class Aplicativo(tk.Tk):
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 0)
         )
         acesso.columnconfigure(1, weight=1)
+
+        ssh = ttk.LabelFrame(self, text="Acesso remoto por túnel SSH (sem VPN)", padding=8)
+        ssh.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(ssh, text="Servidor SSH:").grid(row=0, column=0, sticky="w")
+        self.entrada_ssh = ttk.Entry(ssh, width=20)
+        self.entrada_ssh.insert(0, sugestao_ssh_destino())
+        self.entrada_ssh.grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(
+            ssh, text="Colar", command=self.colar_destino_ssh
+        ).grid(row=0, column=2, padx=(0, 6))
+        ttk.Label(ssh, text="Porta local:").grid(row=0, column=3, sticky="w")
+        self.entrada_porta_ssh = ttk.Entry(ssh, width=6)
+        self.entrada_porta_ssh.insert(0, str(PORTA_WEB))
+        self.entrada_porta_ssh.grid(row=0, column=4, sticky="w", padx=6)
+        ttk.Button(
+            ssh, text="Copiar comando", command=self.copiar_comando_ssh
+        ).grid(row=0, column=5, padx=4)
+        ttk.Button(
+            ssh, text="Abrir no navegador", command=self.abrir_acesso_ssh
+        ).grid(row=0, column=6, padx=4)
+        ttk.Button(
+            ssh, text="Copiar link", command=self.copiar_link_ssh
+        ).grid(row=0, column=7, padx=4)
+        self.comando_ssh = tk.StringVar(value="")
+        ttk.Label(ssh, text="Chave SSH:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.entrada_chave_ssh = ttk.Entry(ssh, width=28)
+        self.entrada_chave_ssh.grid(
+            row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=(6, 0)
+        )
+        ttk.Label(
+            ssh,
+            text="(caminho da chave privada no computador que vai abrir o túnel; "
+            "em branco, usa a chave padrão do SSH)",
+        ).grid(row=1, column=3, columnspan=4, sticky="w", pady=(6, 0))
+
+        ttk.Label(ssh, text="Usuário SSH:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.usuario_ssh = tk.StringVar(value=USUARIO_SSH_PADRAO)
+        self.entrada_usuario_ssh = ttk.Entry(ssh, width=14, textvariable=self.usuario_ssh)
+        self.entrada_usuario_ssh.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(ssh, text="Senha:").grid(row=2, column=2, sticky="w", pady=(6, 0))
+        self.senha_ssh = tk.StringVar(value="")
+        self.entrada_senha_ssh = ttk.Entry(
+            ssh, width=18, textvariable=self.senha_ssh, show="*"
+        )
+        self.entrada_senha_ssh.grid(row=2, column=3, sticky="w", padx=6, pady=(6, 0))
+        ttk.Button(
+            ssh, text="Gerar senha", command=self.gerar_senha_ssh
+        ).grid(row=2, column=4, padx=4, pady=(6, 0))
+        self.botao_criar_usuario_ssh = ttk.Button(
+            ssh, text="Criar/atualizar usuário", command=self.criar_usuario_ssh
+        )
+        self.botao_criar_usuario_ssh.grid(row=2, column=5, padx=4, pady=(6, 0))
+        ttk.Button(
+            ssh, text="Copiar senha", command=self.copiar_senha_ssh
+        ).grid(row=2, column=6, padx=4, pady=(6, 0))
+        self.estado_usuario_ssh = tk.StringVar(
+            value=(
+                "Conta para o túnel SSH: o sistema vai pedir a senha de "
+                "administrador numa janela do próprio sistema."
+            )
+        )
+        ttk.Label(ssh, textvariable=self.estado_usuario_ssh, justify="left").grid(
+            row=3, column=0, columnspan=7, sticky="w", pady=(4, 0)
+        )
+        ttk.Entry(ssh, textvariable=self.comando_ssh, state="readonly").grid(
+            row=4, column=0, columnspan=7, sticky="ew", pady=(6, 0)
+        )
+        self.estado_ssh = tk.StringVar(
+            value="Rode o comando no computador/celular que vai ver as câmeras e "
+            "abra o endereço local no navegador. O app precisa estar aberto aqui."
+        )
+        self.rotulo_estado_ssh = ttk.Label(
+            ssh, textvariable=self.estado_ssh, justify="left"
+        )
+        self.rotulo_estado_ssh.grid(row=5, column=0, columnspan=7, sticky="w", pady=(4, 0))
+        ssh.columnconfigure(1, weight=1)
+        ssh.bind("<Configure>", self._ajustar_largura_ssh)
+        self.entrada_ssh.bind("<KeyRelease>", self._atualizar_comando_ssh)
+        self.entrada_porta_ssh.bind("<KeyRelease>", self._atualizar_comando_ssh)
+        self.entrada_chave_ssh.bind("<KeyRelease>", self._atualizar_comando_ssh)
+
+        aparelhos = ttk.LabelFrame(
+            self, text="Aparelhos com acesso SSH (uma conta e uma chave por aparelho)",
+            padding=8,
+        )
+        aparelhos.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(aparelhos, text="Aparelho:").grid(row=0, column=0, sticky="w")
+        self.nome_aparelho = tk.StringVar(value="")
+        self.entrada_nome_aparelho = ttk.Entry(
+            aparelhos, width=18, textvariable=self.nome_aparelho
+        )
+        self.entrada_nome_aparelho.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(aparelhos, text="Senha:").grid(row=0, column=2, sticky="w")
+        self.senha_aparelho = tk.StringVar(value="")
+        self.entrada_senha_aparelho = ttk.Entry(
+            aparelhos, width=18, textvariable=self.senha_aparelho, show="*"
+        )
+        self.entrada_senha_aparelho.grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Button(
+            aparelhos, text="Gerar senha", command=self.gerar_senha_aparelho
+        ).grid(row=0, column=4, padx=4)
+        self.botao_criar_aparelho = ttk.Button(
+            aparelhos, text="Criar aparelho", command=self.criar_aparelho
+        )
+        self.botao_criar_aparelho.grid(row=0, column=5, padx=4)
+
+        colunas = ("aparelho", "usuario", "chave", "situacao")
+        self.lista_aparelhos = ttk.Treeview(
+            aparelhos, columns=colunas, show="headings", height=4, selectmode="browse"
+        )
+        for coluna, titulo, largura in (
+            ("aparelho", "Aparelho", 140),
+            ("usuario", "Usuário SSH", 130),
+            ("chave", "Chave", 190),
+            ("situacao", "Situação", 120),
+        ):
+            self.lista_aparelhos.heading(coluna, text=titulo)
+            self.lista_aparelhos.column(coluna, width=largura, anchor="w")
+        self.lista_aparelhos.grid(
+            row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0)
+        )
+        self.lista_aparelhos.bind("<Double-1>", self.usar_aparelho_no_tunel)
+        self.lista_aparelhos.bind("<Return>", self.usar_aparelho_no_tunel)
+
+        acoes = ttk.Frame(aparelhos)
+        acoes.grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ttk.Button(
+            acoes, text="Copiar chave privada", command=self.copiar_chave_aparelho
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(
+            acoes, text="Copiar senha", command=self.copiar_senha_aparelho
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            acoes, text="Usar no túnel", command=self.usar_aparelho_no_tunel
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            acoes, text="Copiar comando", command=self.copiar_comando_aparelho
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            acoes, text="Remover aparelho", command=self.remover_aparelho
+        ).pack(side="left", padx=4)
+        self.estado_aparelhos = tk.StringVar(
+            value=(
+                "Cada aparelho tem conta, senha e chave próprias: revogar um "
+                "não afeta os outros. Dê um nome (celular, notebook, tablet...)."
+            )
+        )
+        ttk.Label(aparelhos, textvariable=self.estado_aparelhos, justify="left").grid(
+            row=3, column=0, columnspan=6, sticky="w", pady=(4, 0)
+        )
+        aparelhos.columnconfigure(1, weight=1)
 
         rede = ttk.LabelFrame(self, text="Câmeras na rede local (Wi-Fi)", padding=8)
         rede.pack(fill="x", padx=10)
@@ -1606,6 +2333,17 @@ class Aplicativo(tk.Tk):
             rede,
             text="ID/UID cadastrado no app CMS — procura portas de CMS e confere o serial.",
         ).grid(row=5, column=2, columnspan=6, sticky="w", pady=(6, 0))
+        ttk.Button(
+            rede, text="Copiar URL RTSP", command=self.copiar_url_camera
+        ).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(
+            rede, text="Colar URL RTSP", command=self.colar_url_camera
+        ).grid(row=6, column=1, sticky="w", padx=(4, 0), pady=(6, 0))
+        ttk.Label(
+            rede,
+            text="Cole uma URL rtsp:// completa (com usuário e senha) para adicionar "
+            "a câmera; Copiar URL RTSP leva a URL montada para a área de transferência.",
+        ).grid(row=6, column=2, columnspan=6, sticky="w", pady=(6, 0))
         self.status_busca = tk.StringVar(
             value="Use 'Varredura completa (todos os dados)' para ver IP/MAC/ONVIF/perfis e configurar."
         )
@@ -1615,21 +2353,543 @@ class Aplicativo(tk.Tk):
         rede.columnconfigure(4, weight=1)
         rede.columnconfigure(5, weight=1)
 
+        for campo in (
+            self.entrada_indice,
+            self.combo_ip,
+            self.entrada_caminho,
+            self.entrada_id,
+            self.entrada_nvr,
+            self.entrada_ssh,
+            self.entrada_porta_ssh,
+            self.entrada_chave_ssh,
+            self.entrada_usuario_ssh,
+            self.entrada_senha_ssh,
+        ):
+            self._ligar_menu_contexto(campo)
+
         self.grade = ttk.Frame(self, padding=8)
         self.grade.pack(fill="both", expand=True)
         self.mensagem = tk.StringVar(value="Adicione uma câmera. O índice 0 costuma ser a câmera padrão.")
         ttk.Label(self, textvariable=self.mensagem, padding=8).pack(fill="x")
         self.after(40, self.atualizar_imagens)
         self.after(0, self.atualizar_acesso_web)
+        self.after(0, self._atualizar_comando_ssh)
+        self.after(0, self._atualizar_estado_usuario_ssh)
+        self.after(0, self._atualizar_lista_aparelhos)
+        self.after(200, self._processar_trabalhos)
+
+    def _ajustar_largura_ssh(self, evento):
+        try:
+            self.rotulo_estado_ssh.configure(wraplength=max(320, evento.width - 40))
+        except tk.TclError:
+            pass
+
+    def _detectar_enderecos_locais(self):
+        """Endereços que identificam esta máquina (para saber se o alvo do SSH é ela)."""
+        enderecos = {"localhost", "127.0.0.1", "::1"}
+        try:
+            enderecos.add(socket.gethostname().lower())
+        except OSError:
+            pass
+        ip_local = obter_ip_local()
+        if ip_local:
+            enderecos.add(ip_local.lower())
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                enderecos.add(str(info[4][0]).lower())
+        except OSError:
+            pass
+        return enderecos
+
+    def _porta_local_ssh(self):
+        texto = self.entrada_porta_ssh.get().strip()
+        if not texto.isdigit():
+            raise ValueError("A porta local deve ser um número.")
+        porta = int(texto)
+        if not 1 <= porta <= 65535:
+            raise ValueError("Porta local inválida (entre 1 e 65535).")
+        return porta
+
+    def _destino_ssh(self):
+        """Devolve (destino, porta_local) já com a porta ajustada a conflitos."""
+        destino = self.entrada_ssh.get().strip()
+        if not destino:
+            raise ValueError("Informe o servidor SSH (ex.: usuario@192.168.0.10).")
+        porta_local = self._porta_local_ssh()
+        if porta_local == PORTA_WEB and self._eh_esta_maquina(destino):
+            porta_local = PORTA_WEB + 1
+            self.entrada_porta_ssh.delete(0, "end")
+            self.entrada_porta_ssh.insert(0, str(porta_local))
+            self.estado_ssh.set(
+                f"A porta {PORTA_WEB} já é usada por este app; o túnel usará "
+                f"{porta_local} para não colidir."
+            )
+        return destino, porta_local
+
+    def _eh_esta_maquina(self, destino):
+        host = extrair_host_ssh(destino).lower().strip("[]")
+        return host in self.enderecos_locais
+
+    def _chave_ssh(self):
+        """Caminho da chave privada a usar no comando (vazio = chave padrão)."""
+        return self.entrada_chave_ssh.get().strip() or None
+
+    def _atualizar_comando_ssh(self, evento=None):
+        try:
+            destino, porta_local = self._destino_ssh()
+            self.comando_ssh.set(
+                montar_comando_ssh(destino, porta_local, chave=self._chave_ssh())
+            )
+        except ValueError:
+            self.comando_ssh.set("")
+
+    def copiar_comando_ssh(self):
+        try:
+            destino, porta_local = self._destino_ssh()
+            comando = montar_comando_ssh(
+                destino, porta_local, chave=self._chave_ssh()
+            )
+        except ValueError as exc:
+            messagebox.showerror("Túnel SSH", str(exc), parent=self)
+            return
+        self.comando_ssh.set(comando)
+        copiar_texto(self, comando)
+        self.estado_ssh.set(
+            f"Comando copiado. Rode no computador/celular que vai ver as câmeras e "
+            f"abra http://127.0.0.1:{porta_local} no navegador."
+        )
+
+    def _atualizar_estado_usuario_ssh(self, evento=None):
+        """Mostra se a conta SSH do túnel já existe nesta máquina."""
+        usuario = self.usuario_ssh.get().strip()
+        if usuario and usuario_ssh_existe(usuario):
+            self.estado_usuario_ssh.set(
+                f"Conta \"{usuario}\" já existe nesta máquina. Para trocar a "
+                "senha, digite a nova e clique em \"Criar/atualizar usuário\"."
+            )
+        else:
+            self.estado_usuario_ssh.set(
+                "Conta para o túnel SSH: o sistema vai pedir a senha de "
+                "administrador numa janela do próprio sistema."
+            )
+
+    def gerar_senha_ssh(self):
+        """Preenche o campo de senha com uma senha aleatória."""
+        senha = senha_ssh_aleatoria(16)
+        self.senha_ssh.set(senha)
+        self.estado_usuario_ssh.set(
+            "Senha gerada. Clique em \"Criar/atualizar usuário\" para aplicar "
+            "(o sistema vai pedir a senha de administrador)."
+        )
+
+    def _processar_trabalhos(self):
+        """Consome o que as threads deixaram na fila (sempre no thread do Tk)."""
+        try:
+            while True:
+                item = self.fila_trabalhos.get_nowait()
+                tipo = item[0]
+                if tipo == "aparelho_criado":
+                    self._aparelho_criado(*item[1:])
+                elif tipo == "aparelho_removido":
+                    self._aparelho_removido(*item[1:])
+        except queue.Empty:
+            pass
+        self.after(200, self._processar_trabalhos)
+
+    def _aparelho_selecionado(self):
+        """Dados do aparelho marcado na lista (ou None)."""
+        selecao = self.lista_aparelhos.selection()
+        if not selecao:
+            return None
+        valores = self.lista_aparelhos.item(selecao[0]).get("values", ())
+        if len(valores) < 2:
+            return None
+        usuario = valores[1]
+        for aparelho in self.aparelhos:
+            if aparelho.get("usuario") == usuario:
+                return aparelho
+        return None
+
+    def _atualizar_lista_aparelhos(self):
+        for item in self.lista_aparelhos.get_children():
+            self.lista_aparelhos.delete(item)
+        for aparelho in self.aparelhos:
+            chave = Path(aparelho.get("chave", ""))
+            situacao = (
+                "ativo" if usuario_ssh_existe(aparelho.get("usuario", "")) else "sem conta"
+            )
+            self.lista_aparelhos.insert(
+                "",
+                "end",
+                values=(
+                    aparelho.get("nome", ""),
+                    aparelho.get("usuario", ""),
+                    chave.name,
+                    situacao,
+                ),
+            )
+
+    def gerar_senha_aparelho(self):
+        senha = senha_ssh_aleatoria(16)
+        self.senha_aparelho.set(senha)
+        self.estado_aparelhos.set(
+            "Senha gerada. Clique em \"Criar aparelho\" (o sistema vai pedir "
+            "a senha de administrador)."
+        )
+
+    def copiar_senha_aparelho(self):
+        aparelho = self._aparelho_selecionado()
+        if not aparelho:
+            messagebox.showinfo(
+                "Aparelho", "Escolha um aparelho na lista.", parent=self
+            )
+            return
+        copiar_texto(self, aparelho.get("senha", ""))
+        self.estado_aparelhos.set(
+            f"Senha de {aparelho.get('usuario')} copiada."
+        )
+
+    def copiar_chave_aparelho(self):
+        aparelho = self._aparelho_selecionado()
+        if not aparelho:
+            messagebox.showinfo(
+                "Aparelho", "Escolha um aparelho na lista.", parent=self
+            )
+            return
+        chave = Path(aparelho.get("chave", ""))
+        if not chave.exists():
+            messagebox.showerror(
+                "Aparelho", f"A chave {chave} não está mais neste computador.",
+                parent=self,
+            )
+            return
+        copiar_texto(self, chave.read_text(encoding="utf-8"))
+        self.estado_aparelhos.set(
+            f"Chave privada de {aparelho.get('usuario')} copiada. Cole no "
+            "aparelho (Termius/Termux) e grave com permissão 600."
+        )
+
+    def usar_aparelho_no_tunel(self, evento=None):
+        """Coloca o usuário e a chave do aparelho no quadro do túnel SSH."""
+        aparelho = self._aparelho_selecionado()
+        if not aparelho:
+            if evento is None:
+                messagebox.showinfo(
+                    "Aparelho", "Escolha um aparelho na lista.", parent=self
+                )
+            return
+        host = extrair_host_ssh(self.entrada_ssh.get().strip())
+        if not host:
+            host = sugestao_ssh_host()
+        self.entrada_ssh.delete(0, "end")
+        self.entrada_ssh.insert(0, f"{aparelho.get('usuario')}@{host}")
+        self.entrada_chave_ssh.delete(0, "end")
+        self.entrada_chave_ssh.insert(0, aparelho.get("chave", ""))
+        self._atualizar_comando_ssh()
+        self.estado_ssh.set(
+            f"Túnel preparado para {aparelho.get('nome')} "
+            f"({aparelho.get('usuario')}). Copie o comando e rode no aparelho."
+        )
+        self.estado_aparelhos.set(
+            f"{aparelho.get('nome')} selecionado: usuário e chave já no túnel."
+        )
+
+    def copiar_comando_aparelho(self):
+        aparelho = self._aparelho_selecionado()
+        if not aparelho:
+            messagebox.showinfo(
+                "Aparelho", "Escolha um aparelho na lista.", parent=self
+            )
+            return
+        self.usar_aparelho_no_tunel()
+        self.copiar_comando_ssh()
+
+    def criar_aparelho(self):
+        nome = self.nome_aparelho.get().strip()
+        if not nome:
+            messagebox.showinfo(
+                "Aparelho", "Dê um nome ao aparelho (celular, notebook...).",
+                parent=self,
+            )
+            return
+        senha = self.senha_aparelho.get() or senha_ssh_aleatoria(16)
+        if len(senha) < 8:
+            messagebox.showerror(
+                "Aparelho", "A senha precisa ter ao menos 8 caracteres.", parent=self
+            )
+            return
+        usuario = nome_usuario_aparelho(
+            nome, [a.get("usuario") for a in self.aparelhos]
+        )
+        self.botao_criar_aparelho.configure(state="disabled")
+        self.estado_aparelhos.set(
+            "Aguarde a janela do sistema para autorizar a criação da conta..."
+        )
+
+        def trabalho():
+            erro = None
+            caminho = chave_aparelho(usuario)
+            try:
+                gerar_chave_para(caminho, f"cameras-{usuario}")
+                criar_usuario_ssh_sistema(usuario, senha, caminho)
+            except Exception as exc:  # noqa: BLE001 - erro vem do sistema/polkit
+                erro = exc
+            self.fila_trabalhos.put(
+                ("aparelho_criado", nome, usuario, senha, str(caminho), erro)
+            )
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _aparelho_criado(self, nome, usuario, senha, caminho, erro):
+        self.botao_criar_aparelho.configure(state="normal")
+        if erro is not None:
+            self.estado_aparelhos.set(f"Não foi possível criar o aparelho: {erro}")
+            messagebox.showerror("Aparelho", str(erro), parent=self)
+            return
+        self.aparelhos.append(
+            {
+                "nome": nome,
+                "usuario": usuario,
+                "senha": senha,
+                "chave": caminho,
+                "criado_em": time.strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+        salvar_aparelhos(self.aparelhos)
+        self._atualizar_lista_aparelhos()
+        self.senha_aparelho.set(senha)
+        self.nome_aparelho.set("")
+        self.estado_aparelhos.set(
+            f"Conta \"{usuario}\" criada para {nome}. Copie a chave privada "
+            "(botão abaixo) e leve ao aparelho; a senha também funciona."
+        )
+
+    def remover_aparelho(self):
+        aparelho = self._aparelho_selecionado()
+        if not aparelho:
+            messagebox.showinfo(
+                "Aparelho", "Escolha um aparelho na lista.", parent=self
+            )
+            return
+        usuario = aparelho.get("usuario", "")
+        if not messagebox.askyesno(
+            "Remover aparelho",
+            f"Remover a conta \"{usuario}\"?\n\n"
+            "O aparelho perde o acesso às câmeras na hora.",
+            parent=self,
+        ):
+            return
+        self.estado_aparelhos.set(
+            "Aguarde a janela do sistema para autorizar a remoção..."
+        )
+
+        def trabalho():
+            erro = None
+            try:
+                remover_usuario_ssh_sistema(usuario)
+            except Exception as exc:  # noqa: BLE001
+                erro = exc
+            self.fila_trabalhos.put(("aparelho_removido", usuario, erro))
+
+        threading.Thread(target=trabalho, daemon=True).start()
+
+    def _aparelho_removido(self, usuario, erro):
+        if erro is not None:
+            self.estado_aparelhos.set(f"Não foi possível remover: {erro}")
+            messagebox.showerror("Aparelho", str(erro), parent=self)
+            return
+        self.aparelhos = [
+            a for a in self.aparelhos if a.get("usuario") != usuario
+        ]
+        salvar_aparelhos(self.aparelhos)
+        self._atualizar_lista_aparelhos()
+        self.estado_aparelhos.set(
+            f"Conta \"{usuario}\" removida: aquele aparelho não acessa mais as câmeras."
+        )
+
+    def copiar_senha_ssh(self):
+        senha = self.senha_ssh.get()
+        if not senha:
+            messagebox.showinfo(
+                "Senha SSH", "Gere ou digite uma senha primeiro.", parent=self
+            )
+            return
+        copiar_texto(self, senha)
+        self.estado_usuario_ssh.set(
+            "Senha copiada. É com ela que o celular entra no SSH."
+        )
+
+    def criar_usuario_ssh(self):
+        """Cria (ou ajusta) a conta SSH do túnel, com a senha digitada aqui."""
+        usuario = self.usuario_ssh.get().strip()
+        senha = self.senha_ssh.get()
+        if not senha:
+            senha = senha_ssh_aleatoria(16)
+            self.senha_ssh.set(senha)
+        try:
+            chave = garantir_chave_cameras()
+            criar_usuario_ssh_sistema(usuario, senha, chave)
+        except Exception as exc:  # noqa: BLE001 - erro vem do sistema/polkit
+            self.estado_usuario_ssh.set(f"Não foi possível criar o usuário: {exc}")
+            messagebox.showerror("Usuário SSH", str(exc), parent=self)
+            return
+        self.estado_usuario_ssh.set(
+            f"Usuário \"{usuario}\" pronto: senha definida e chave "
+            "autorizada. Use esse usuário no campo \"Servidor SSH\"."
+        )
+        # Se o campo de destino ainda não tem usuário, sugere o novo.
+        destino = self.entrada_ssh.get().strip()
+        if not destino or "@" not in destino:
+            host = extrair_host_ssh(destino) or sugestao_ssh_host()
+            self.entrada_ssh.delete(0, "end")
+            self.entrada_ssh.insert(0, f"{usuario}@{host}")
+            self._atualizar_comando_ssh()
+
+    def colar_destino_ssh(self):
+        """Cola o destino do túnel: aceita `usuario@host` ou um comando ssh pronto."""
+        texto = obter_texto_colado(self).strip()
+        if not texto:
+            self.estado_ssh.set("A área de transferência está vazia.")
+            return
+        analisado = analisar_comando_ssh(texto)
+        if analisado is not None:
+            destino, porta_local, chave = analisado
+            self.entrada_ssh.delete(0, "end")
+            self.entrada_ssh.insert(0, destino)
+            if porta_local:
+                self.entrada_porta_ssh.delete(0, "end")
+                self.entrada_porta_ssh.insert(0, str(porta_local))
+            if chave:
+                self.entrada_chave_ssh.delete(0, "end")
+                self.entrada_chave_ssh.insert(0, chave)
+            self._atualizar_comando_ssh()
+            self.estado_ssh.set(
+                f"Destino colado do comando SSH ({destino}). Confira e copie o comando."
+            )
+            return
+        try:
+            montar_comando_ssh(texto)
+        except ValueError as exc:
+            messagebox.showerror(
+                "Colar destino",
+                f"O texto colado não é um destino SSH válido.\n\n{exc}",
+                parent=self,
+            )
+            return
+        self.entrada_ssh.delete(0, "end")
+        self.entrada_ssh.insert(0, texto)
+        self._atualizar_comando_ssh()
+        self.estado_ssh.set("Destino colado.")
+
+    def _menu_contexto(self, widget):
+        """Menu de contexto (copiar/colar) dos campos de texto."""
+        menu = tk.Menu(widget, tearoff=0)
+        menu.add_command(
+            label="Copiar", command=lambda: self._acao_contexto(widget, "copiar")
+        )
+        menu.add_command(
+            label="Colar", command=lambda: self._acao_contexto(widget, "colar")
+        )
+        menu.add_command(
+            label="Selecionar tudo",
+            command=lambda: self._acao_contexto(widget, "selecionar"),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label="Limpar", command=lambda: self._acao_contexto(widget, "limpar")
+        )
+        return menu
+
+    def _acao_contexto(self, widget, acao):
+        if acao == "copiar":
+            texto = widget.get()
+            if isinstance(texto, str) and texto:
+                copiar_texto(self, texto)
+        elif acao == "colar":
+            texto = obter_texto_colado(self)
+            if not texto:
+                return
+            if isinstance(widget, ttk.Combobox):
+                widget.set(texto.strip())
+            else:
+                widget.delete(0, "end")
+                widget.insert(0, texto)
+            widget.icursor("end")
+        elif acao == "selecionar":
+            widget.selection_range(0, "end")
+            widget.icursor("end")
+        elif acao == "limpar":
+            if isinstance(widget, ttk.Combobox):
+                widget.set("")
+            else:
+                widget.delete(0, "end")
+
+    def _mostrar_menu_contexto(self, evento, widget):
+        menu = self._menu_contexto(widget)
+        try:
+            menu.tk_popup(evento.x_root, evento.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _ligar_menu_contexto(self, widget):
+        widget.bind(
+            "<Button-3>", lambda evento: self._mostrar_menu_contexto(evento, widget)
+        )
+        if sys.platform == "darwin":
+            # No macOS o botão secundário é o Button-2 (o do meio colaria).
+            widget.bind(
+                "<Button-2>", lambda evento: self._mostrar_menu_contexto(evento, widget)
+            )
+
+    def link_de_acesso(self, base=None):
+        """Link que abre as câmeras já autenticado (sem pedir login)."""
+        if base is None:
+            base = f"http://127.0.0.1:{PORTA_WEB}"
+        base = base.rstrip("/")
+        return f"{base}/?acesso={self.token_acesso}"
+
+    def abrir_acesso_ssh(self):
+        try:
+            _, porta_local = self._destino_ssh()
+        except ValueError as exc:
+            messagebox.showerror("Túnel SSH", str(exc), parent=self)
+            return
+        url = self.link_de_acesso(f"http://127.0.0.1:{porta_local}")
+        if not webbrowser.open(url):
+            self.estado_ssh.set(f"Abra manualmente no navegador: {url}")
+
+    def copiar_link_ssh(self):
+        """Link local (com acesso) para abrir no outro computador/celular."""
+        try:
+            _, porta_local = self._destino_ssh()
+        except ValueError as exc:
+            messagebox.showerror("Túnel SSH", str(exc), parent=self)
+            return
+        link = self.link_de_acesso(f"http://127.0.0.1:{porta_local}")
+        copiar_texto(self, link)
+        self.estado_ssh.set(
+            f"Link copiado ({link}). Abra no aparelho que vai ver as câmeras, "
+            "depois de subir o túnel SSH — ele entra direto, sem pedir login."
+        )
 
     def copiar_link(self):
         link = self.link_web.get()
-        if not link.startswith("https://"):
+        if not (link.startswith("https://") or link.startswith("http://")):
             self.estado_web.set("O link ainda não está disponível.")
             return
-        self.clipboard_clear()
-        self.clipboard_append(link)
-        self.estado_web.set("Link HTTPS copiado. Conecte o celular à VPN e abra o link.")
+        link = self.link_de_acesso(link)
+        copiar_texto(self, link)
+        if link.startswith("https://"):
+            self.estado_web.set(
+                "Link com acesso automático copiado (não vai pedir login). "
+                "Conecte o celular à VPN e abra o link."
+            )
+        else:
+            self.estado_web.set(
+                "Link local com acesso automático copiado. Para ver de outro "
+                "computador, use o túnel SSH abaixo."
+            )
 
     def alternar_credenciais(self):
         if self.temporizador_credenciais is not None:
@@ -1787,33 +3047,36 @@ class Aplicativo(tk.Tk):
                 estado = "HTTPS privado ativo; conecte o celular à mesma VPN Tailscale."
 
         if identidade is None:
-            self._parar_servidor_web()
-            self.link_web.set("Indisponível até conectar à VPN")
-            self.botao_copiar_link.configure(state="disabled")
+            # Sem Tailscale o servidor continua no ar em 127.0.0.1: é ele que o
+            # túnel SSH encaminha para o outro computador.
+            if not self._iniciar_servidor_web():
+                self.link_web.set("Não foi possível iniciar o servidor")
+                self.botao_copiar_link.configure(state="disabled")
+                self.botao_ativar_https.configure(state="disabled")
+                self.after(5000, self.atualizar_acesso_web)
+                return
+            self.link_web.set(f"http://127.0.0.1:{PORTA_WEB}")
+            self.botao_copiar_link.configure(state="normal")
             self.botao_ativar_https.configure(state="disabled")
-            self.estado_web.set(estado)
+            self.estado_web.set(
+                f"{estado} Para ver de outro computador, use o túnel SSH abaixo."
+            )
         else:
             hostname, node_id = identidade
-            if hostname != self.hostname_servidor_web or self.servidor_web is None:
+            if hostname != self.hostname_servidor_web:
                 self._parar_servidor_web()
-                try:
-                    self.servidor_web = ServidorCameras(self.cameras, self.senha_web)
-                    self.thread_servidor_web = threading.Thread(
-                        target=self.servidor_web.serve_forever,
-                        name="servidor-cameras",
-                        daemon=True,
-                    )
-                    self.thread_servidor_web.start()
-                    self.hostname_servidor_web = hostname
-                except OSError as exc:
-                    self.servidor_web = None
-                    self.thread_servidor_web = None
+                if not self._iniciar_servidor_web():
                     self.link_web.set("Não foi possível iniciar o servidor")
                     self.botao_copiar_link.configure(state="disabled")
-                    self.estado_web.set(f"Falha ao iniciar o servidor: {exc}")
-                else:
-                    self.link_web.set("Solicitando certificado HTTPS...")
-                    self.botao_copiar_link.configure(state="disabled")
+                    self.estado_web.set("Falha ao iniciar o servidor de câmeras.")
+                    self.after(5000, self.atualizar_acesso_web)
+                    return
+                self.hostname_servidor_web = hostname
+                self.link_web.set("Solicitando certificado HTTPS...")
+                self.botao_copiar_link.configure(state="disabled")
+            elif self.serve_ativo:
+                self.link_web.set(f"https://{hostname}")
+                self.botao_copiar_link.configure(state="normal")
             if (
                 self.servidor_web is not None
                 and self.hostname_servidor_web == hostname
@@ -1892,6 +3155,27 @@ class Aplicativo(tk.Tk):
                 or "O Tailscale não conseguiu ativar HTTPS."
             )
         self.resultado_https = (hostname, ativo, mensagem, url_autorizacao)
+
+    def _iniciar_servidor_web(self):
+        """Sobe o servidor HTTP local (127.0.0.1) usado pelo Tailscale e pelo túnel SSH."""
+        if self.servidor_web is not None:
+            return True
+        try:
+            self.servidor_web = ServidorCameras(
+                self.cameras, self.senha_web, self.token_acesso
+            )
+            self.thread_servidor_web = threading.Thread(
+                target=self.servidor_web.serve_forever,
+                name="servidor-cameras",
+                daemon=True,
+            )
+            self.thread_servidor_web.start()
+        except OSError as exc:
+            self.servidor_web = None
+            self.thread_servidor_web = None
+            self.estado_web.set(f"Falha ao iniciar o servidor: {exc}")
+            return False
+        return True
 
     def _parar_servidor_web(self):
         self.serve_ativo = False
@@ -2479,6 +3763,51 @@ class Aplicativo(tk.Tk):
         )
         self.status_busca.set(" ".join(partes))
 
+    def _url_da_camera_rede(self, texto):
+        """Monta a URL RTSP a partir do texto do campo 'Câmera'."""
+        url_nvr = self._canais_nvr.get(texto)
+        if url_nvr:
+            return url_nvr
+        if "://" in texto:
+            return texto.strip()
+        ip_porta = texto.split(" ")[0]
+        ip, separador, porta = ip_porta.partition(":")
+        porta_rtsp = int(porta) if separador and porta.isdigit() else 554
+        caminho = self.entrada_caminho.get().strip() or "/stream1"
+        if not caminho.startswith("/"):
+            caminho = "/" + caminho
+        return f"rtsp://{ip}:{porta_rtsp}{caminho}"
+
+    def copiar_url_camera(self):
+        """Copia a URL RTSP da câmera escolhida (para usar em outro player)."""
+        texto = self.combo_ip.get().strip()
+        if not texto:
+            messagebox.showerror(
+                "Copiar URL RTSP",
+                "Escolha ou digite a câmera no campo 'Câmera' antes de copiar.",
+                parent=self,
+            )
+            return
+        url = self._url_da_camera_rede(texto)
+        copiar_texto(self, url)
+        self.mensagem.set(f"URL copiada: {url}")
+
+    def colar_url_camera(self):
+        """Cola uma URL RTSP (com usuário e senha) e adiciona a câmera."""
+        texto = obter_texto_colado(self).strip()
+        if not texto:
+            self.mensagem.set("A área de transferência está vazia.")
+            return
+        if "://" not in texto:
+            self.combo_ip.set(texto)
+            self.mensagem.set(
+                "Texto colado no campo 'Câmera'. Confira o caminho RTSP e clique "
+                "em 'Adicionar câmera de rede'."
+            )
+            return
+        self.combo_ip.set(texto)
+        self.adicionar_camera_rede()
+
     def adicionar_camera_rede(self):
         texto = self.combo_ip.get().strip()
         if not texto:
@@ -2486,25 +3815,16 @@ class Aplicativo(tk.Tk):
                 "Câmera de rede", "Busque ou digite o IP da câmera.", parent=self
             )
             return
-        url = self._canais_nvr.get(texto)
-        if url:
+        url_nvr = self._canais_nvr.get(texto)
+        if url_nvr:
             try:
-                host = urlsplit(url).hostname or ""
+                host = urlsplit(url_nvr).hostname or ""
             except ValueError:
                 host = ""
             rotulo = texto if (not host or host in texto) else f"{texto} ({host})"
-            self._adicionar_camera_interna(url, rotulo)
+            self._adicionar_camera_interna(url_nvr, rotulo)
             return
-        if "://" in texto:
-            url = texto
-        else:
-            ip_porta = texto.split(" ")[0]
-            ip, separador, porta = ip_porta.partition(":")
-            porta_rtsp = int(porta) if separador and porta.isdigit() else 554
-            caminho = self.entrada_caminho.get().strip() or "/stream1"
-            if not caminho.startswith("/"):
-                caminho = "/" + caminho
-            url = f"rtsp://{ip}:{porta_rtsp}{caminho}"
+        url = self._url_da_camera_rede(texto)
         try:
             rotulo = urlsplit(url).hostname or texto
         except ValueError:
