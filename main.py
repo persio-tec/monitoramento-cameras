@@ -4,6 +4,7 @@ ou por um túnel SSH."""
 import base64
 import getpass
 import hashlib
+import html
 import ipaddress
 import json
 import os
@@ -1819,9 +1820,10 @@ class ManipuladorCameras(BaseHTTPRequestHandler):
             for indice, camera in sorted(self.server.cameras.items()):
                 if camera.obter_frame() is None:
                     continue
+                rotulo_seguro = html.escape(str(camera.rotulo), quote=True)
                 paineis.append(
-                    f"<section><h2>Câmera {camera.rotulo}</h2>"
-                    f'<img src="/stream/{indice}" alt="Câmera {camera.rotulo}"></section>'
+                    f"<section><h2>Câmera {rotulo_seguro}</h2>"
+                    f'<img src="/stream/{indice}" alt="Câmera {rotulo_seguro}"></section>'
                 )
             conteudo = (
                 "<!doctype html><html lang=\"pt-BR\"><meta name=\"viewport\" "
