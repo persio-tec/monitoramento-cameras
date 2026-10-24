@@ -2031,6 +2031,8 @@ class Camera:
     def fechar(self):
         self.gravando.clear()
         self._parar.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
 
 
 class Aplicativo(tk.Tk):
